@@ -1,45 +1,50 @@
-FROM ubuntu:20.04
+# ---- Base: PHP 8.3 + Apache ----
+# Pawtucket2 ist das öffentliche Frontend und benötigt PHP + ähnliche Extensions.
+# Offizielles Repo: https://github.com/collectiveaccess/pawtucket2
+FROM php:8.3-apache
 
-ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y \
+    libjpeg62-turbo-dev libpng-dev libfreetype6-dev \
+    libzip-dev libonig-dev libxml2-dev libicu-dev \
+    unzip git curl nano \
+ && docker-php-ext-configure gd --with-freetype --with-jpeg \
+ && docker-php-ext-install pdo pdo_mysql gd mbstring zip intl exif
 
-#Apache
-ARG APACHE_VERSION=2.4.63
-RUN apt -qq update && apt-get -qq install curl wget gnupg && apt-get -qq install wget vim libreadline-dev libssl-dev libpcre3-dev libexpat1-dev build-essential bison zlib1g-dev libxss1 libappindicator1 libindicator7 sudo tzdata unzip less
+RUN a2enmod rewrite \
+ && sed -ri 's/AllowOverride None/AllowOverride All/g' /etc/apache2/apache2.conf
 
-RUN wget https://ai.galib.uga.edu/files/httpd-$APACHE_VERSION-w-apr.tar.gz && tar xzf httpd-$APACHE_VERSION-w-apr.tar.gz && cd httpd-$APACHE_VERSION && ./configure  '--prefix=/app/apache2' '--with-apxs2=/app/apache2/bin/apxs' '--with-mysqli' '--with-pear' '--with-xsl' '--with-pspell' '--enable-ssl' '--with-gettext' '--with-gd' '--enable-mbstring' '--with-mcrypt' '--enable-soap' '--enable-sockets' '--with-libdir=/lib/i386-linux-gnu' '--with-jpeg-dir=/usr' '--with-png-dir=/usr' '--with-curl' '--with-pdo-mysql' '--enable-so' '--with-included-apr' && make -j$(nproc) && make install && cd ..&& rm -rf httpd-$APACHE_VERSION*
+# Composer installieren
+RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-ENV PATH /app/apache2/bin:$PATH
+# Pawtucket2-Code
+COPY . /var/www/html
+WORKDIR /var/www/html
 
-RUN sed -i "s/\/snap\/bin/\/snap\/bin:\/app\/apache2\/bin/" /etc/sudoers
+# Dependencies installieren
+RUN composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader || true
 
-#PHP
-ARG PHP_VERSION=8.2.24
-RUN apt -qq update && apt-get -qq install libcurl4-gnutls-dev pkg-config libpng-dev libonig-dev libsqlite3-dev libxml2-dev libzip-dev libwebp-dev libjpeg-dev libmemcached-dev memcached && wget https://www.php.net/distributions/php-$PHP_VERSION.tar.gz && tar xzf php-$PHP_VERSION.tar.gz && cd php-$PHP_VERSION && './configure'  '--prefix=/usr/local' '--with-apxs2=/app/apache2/bin/apxs' '--with-mysqli' '--enable-mbstring' '--with-pdo-mysql' '--with-openssl' '--with-zlib' '--enable-gd' '--with-jpeg' '--with-webp' '--enable-opcache' '--with-curl' '--enable-exif' '--with-zip' '--enable-intl' '--enable-bcmath' && make -j$(nproc) && make install && cp php.ini-production /usr/local/lib/php.ini && cd .. && rm -rf php-$PHP_VERSION*
+# setup.php bereitstellen (Repo liefert setup.php-dist)
+RUN if [ -f "/var/www/html/setup.php-dist" ] && [ ! -f "/var/www/html/setup.php" ]; then \
+      cp /var/www/html/setup.php-dist /var/www/html/setup.php; \
+    fi
 
-RUN apt -qq update && apt-get -qq install autoconf && wget https://pecl.php.net/get/memcached-3.1.5.tgz && tar xzf memcached-3.1.5.tgz && cd memcached-3.1.5 && phpize && ./configure && make && make install && echo "extension=memcached.so" >> /usr/local/lib/php.ini && cd .. && rm -rf memcached-3.1.5*
+# Medienlink auf Providence: Symlink, damit Pawtucket die gleichen Medien nutzt.
+# Pfad /pawtucket/media/collectiveaccess -> /providence/media/collectiveaccess
+# In Render-Prod kannst du das über persistente Volumes/Env konfigurieren.
+# Community-Doku zum gemeinsamen Medienordner:
+# https://imaginingfutures.github.io/if-documentation/content/developers/replicate/3-install.html
+RUN mkdir -p /var/www/html/media \
+ && ln -s /var/www/html/media/collectiveaccess /var/www/html/media/collectiveaccess || true
 
-#Config changes for php
-RUN sed -i "s/memory_limit = 128M/memory_limit = 1G/" /usr/local/lib/php.ini
+# PHP-Limits optional anheben (Frontend zeigt große Medien an)
+RUN { \
+      echo "upload_max_filesize=64M"; \
+      echo "post_max_size=64M"; \
+      echo "memory_limit=256M"; \
+    } > /usr/local/etc/php/conf.d/ca.ini
 
-#PHPRedis
-RUN apt update && apt-get install -qq -y libzstd-dev && wget https://github.com/phpredis/phpredis/archive/refs/tags/5.3.4.tar.gz && tar xzf 5.3.4.tar.gz && cd phpredis-5.3.4 && phpize && ./configure --enable-redis-zstd && make -j$(nproc) && make install && echo "extension=redis.so" >> /usr/local/lib/php.ini &&  cd .. && rm -rf phpredis-5.3.4
+COPY docker/entrypoint-pawtucket.sh /usr/local/bin/entrypoint-pawtucket.sh
+RUN chmod +x /usr/local/bin/entrypoint-pawtucket.sh
 
-#Composer
-RUN curl --output /usr/local/bin/composer https://getcomposer.org/composer.phar     && chmod +x /usr/local/bin/composer
-
-#GitLab runner
-ARG LOCAL_UID=1000
-RUN adduser --uid $LOCAL_UID --gecos 'gitlab-runner user' --disabled-password gitlab-runner
-
-#Prepare docroot
-RUN rm -rf /app/apache2/htdocs
-
-#Copy startup script, setup file, and permissions script
-ARG SERVERNAME=localhost:8080
-COPY docker_templates/gitlab-runner /etc/sudoers.d/
-COPY docker_templates/httpd.conf /app/apache2/conf/
-RUN sed -i "s/localhost\:8080/$SERVERNAME/" /app/apache2/conf/httpd.conf
-
-USER gitlab-runner
-
-CMD ["bash", "-c", "sudo /app/apache2/bin/apachectl -D FOREGROUND"]
+EXPOSE 80
+CMD ["/usr/local/bin/entrypoint-pawtucket.sh"]
